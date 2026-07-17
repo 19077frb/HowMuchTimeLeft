@@ -496,6 +496,29 @@ function calcNetDuration(intervals, s) {
   return Math.max(0, total);
 }
 
+/** Merge overlapping intervals into non-overlapping ones */
+function mergeIntervals(intervals) {
+  if (!intervals || intervals.length === 0) return [];
+  // Convert to minutes, handle cross-midnight
+  const normalized = intervals.map(([si, so]) => {
+    const inMin = timeToMinutes(si);
+    let outMin = timeToMinutes(so);
+    if (outMin < inMin) outMin += 1440;
+    return [inMin, outMin];
+  });
+  normalized.sort((a, b) => a[0] - b[0]);
+  const merged = [normalized[0].slice()];
+  for (let i = 1; i < normalized.length; i++) {
+    const last = merged[merged.length - 1];
+    if (normalized[i][0] <= last[1]) {
+      last[1] = Math.max(last[1], normalized[i][1]);
+    } else {
+      merged.push(normalized[i].slice());
+    }
+  }
+  return merged;
+}
+
 function calcDayBalance(dateKeyStr, useSettings = null) {
   const s = useSettings || settings;
   const data = allPunches[dateKeyStr];
@@ -511,14 +534,23 @@ function calcDayBalance(dateKeyStr, useSettings = null) {
     return { target: netTarget, isWorkday: true, unfilled: true };
   }
 
-  // Regular punch net duration (minus Rest)
-  const regularWorked = hasPunches ? calcNetDuration(data.punches, s) : 0;
+  // Merge all intervals (punch + leave) first, then calculate
+  const allIntervals = [
+    ...(hasPunches ? data.punches : []),
+    ...(hasLeave ? data.leaveRecords : []),
+  ];
+  const merged = mergeIntervals(allIntervals);
+  // Convert merged minutes back to time strings for calcNetDuration
+  const mergedAsStrings = merged.map(([start, end]) => [
+    minutesToTimeHM(start % 1440),
+    minutesToTimeHM(end % 1440),
+  ]);
+  const effectiveWorked = calcNetDuration(mergedAsStrings, s);
 
-  // Leave net duration (minus Rest within leave periods) — treated as worked time
+  // For display: calculate regular and leave portions separately (no double-counting)
+  const regularWorked = hasPunches ? calcNetDuration(data.punches, s) : 0;
   const leaveDuration = hasLeave ? calcNetDuration(data.leaveRecords, s) : 0;
 
-  // Effective = regular work + leave (leave fills the gap)
-  const effectiveWorked = regularWorked + leaveDuration;
   const balance = effectiveWorked - netTarget; // + = overflow, - = deficit
 
   return {
