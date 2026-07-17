@@ -234,8 +234,13 @@ body {
   <!-- Header -->
   <div class="header">
     <h1>⏳ 你的时间非常值钱</h1>
-    <div class="salary-preview">
-      每分钟价值 <span id="salaryPerMin">--</span> 元 ｜ 预估本月实发 <span id="estimatedSalary">--</span> 元 ｜ 扣款合计 <span id="salaryDelta">--</span> 元
+    <div class="salary-preview" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0 12px;">
+      <div>每分钟价值 <span id="salaryPerMin">--</span> 元</div>
+      <div>预估本月税前 <span id="estimatedGross">--</span> 元</div>
+      <div>预估本月实发 <span id="estimatedNet">--</span> 元</div>
+      <div>考勤扣款 <span id="attendDeduction">--</span> 元</div>
+      <div>劳务税 <span id="taxAmount">--</span> 元</div>
+      <div>总扣款 <span id="salaryDelta">--</span> 元</div>
     </div>
   </div>
 
@@ -867,10 +872,21 @@ function renderSummary() {
   document.getElementById('sumTotalDeduction').textContent = s.totalDeduction > 0
     ? `-${s.totalDeduction.toFixed(2)} 元` : '0 元';
   document.getElementById('salaryPerMin').textContent = s.salaryPerMin.toFixed(4);
-  document.getElementById('estimatedSalary').textContent = s.estimated.toFixed(2);
+  document.getElementById('estimatedGross').textContent = s.estimated.toFixed(2);
+  const gross = s.estimated;
+  const tax = gross <= 4000 ? Math.max(0, (gross - 800) * 0.2) : gross * 0.2;
+  const net = Math.max(0, gross - tax);
+  document.getElementById('estimatedNet').textContent = net.toFixed(2);
+  const attendEl = document.getElementById('attendDeduction');
+  attendEl.textContent = s.totalDeduction > 0 ? `-${s.totalDeduction.toFixed(2)}` : '0.00';
+  attendEl.style.color = s.totalDeduction > 0 ? 'var(--red)' : 'var(--text2)';
+  const taxEl = document.getElementById('taxAmount');
+  taxEl.textContent = tax > 0 ? `-${tax.toFixed(2)}` : '0.00';
+  taxEl.style.color = tax > 0 ? 'var(--red)' : 'var(--text2)';
   const deltaEl = document.getElementById('salaryDelta');
-  deltaEl.textContent = s.totalDeduction > 0 ? `-${s.totalDeduction.toFixed(2)}` : '0.00';
-  deltaEl.style.color = s.totalDeduction > 0 ? 'var(--red)' : 'var(--text2)';
+  const totalDeductionWithTax = s.totalDeduction + tax;
+  deltaEl.textContent = totalDeductionWithTax > 0 ? `-${totalDeductionWithTax.toFixed(2)}` : '0.00';
+  deltaEl.style.color = totalDeductionWithTax > 0 ? 'var(--red)' : 'var(--text2)';
 }
 
 function refreshAll() {
