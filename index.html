@@ -568,7 +568,7 @@ function calcDayBalance(dateKeyStr, useSettings = null) {
 
 // ============ WORKDAY JUDGMENT (manual override) ============
 // dayOverrides: { '2026-06-10': 'holiday', '2026-06-14': 'swap' }
-// 'holiday' = 法定假日（不考勤）
+// 'holiday' = 法定假日（不考勤，但工作日上的假日算计薪天数+满勤）
 // 'swap'    = 调休补班（需考勤）
 // undefined = 默认（周一～五上班，周六日休息）
 
@@ -576,21 +576,36 @@ function getDayOverride(y, m, d) {
   return dayOverrides[dateKey(y, m, d)] || null;
 }
 
+function isWeekend(y, m, d) {
+  const dow = new Date(y, m - 1, d).getDay();
+  return dow === 0 || dow === 6;
+}
+
 function isWorkday(y, m, d) {
   const override = getDayOverride(y, m, d);
-  const date = new Date(y, m - 1, d);
-  const dow = date.getDay();
-  const weekend = dow === 0 || dow === 6;
   if (override === 'holiday') return false;
   if (override === 'swap') return true;
-  return !weekend;
+  return !isWeekend(y, m, d);
+}
+
+/** Is this a "salary day"? = workday OR workday-based holiday (not weekend holiday) */
+function isSalaryDay(y, m, d) {
+  const override = getDayOverride(y, m, d);
+  if (override === 'swap') return true;
+  if (override === 'holiday') return !isWeekend(y, m, d); // weekday holiday counts, weekend holiday ignored
+  return !isWeekend(y, m, d);
+}
+
+/** Is this a weekday that's set as holiday (paid full, no attendance needed)? */
+function isPaidHoliday(y, m, d) {
+  return getDayOverride(y, m, d) === 'holiday' && !isWeekend(y, m, d);
 }
 
 function countWorkdaysInMonth(y, m) {
   let count = 0;
   const days = new Date(y, m, 0).getDate();
   for (let d = 1; d <= days; d++) {
-    if (isWorkday(y, m, d)) count++;
+    if (isSalaryDay(y, m, d)) count++;
   }
   return count;
 }
@@ -607,7 +622,14 @@ function calcMonthlySummary() {
 
   for (let d = 1; d <= days; d++) {
     const key = dateKey(y, m, d);
-    if (!isWorkday(y, m, d)) continue;
+    // Skip non-salary days entirely (weekends, weekend holidays)
+    if (!isSalaryDay(y, m, d)) continue;
+    // Paid holidays (weekday holidays) count as full attendance
+    if (isPaidHoliday(y, m, d)) {
+      filledWorkDays++;
+      // balance = 0 (full attendance, no surplus/deficit)
+      continue;
+    }
     const r = calcDayBalance(key);
     if (!r.unfilled) {
       filledWorkDays++;
