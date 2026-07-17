@@ -303,7 +303,9 @@ body {
       <div class="row">
         <label>数据管理</label>
         <button class="btn btn-sm" style="background:#2e7d32;" onclick="exportData()">📥 导出数据</button>
-        <button class="btn btn-sm" style="background:#1565c0;" onclick="document.getElementById('importFile').click()">📤 导入数据</button>
+        <button class="btn btn-sm" style="background:#1565c0;" onclick="document.getElementById('importFile').click()">📤 导入JSON</button>
+        <button class="btn btn-sm" style="background:#6a1b9a;" onclick="document.getElementById('importXlsxFile').click()">📊 导入Excel</button>
+        <input type="file" id="importXlsxFile" accept=".xlsx" style="display:none;" onchange="importXlsx(event)">
         <button class="btn btn-secondary btn-sm" onclick="resetAll()">🔄 重置</button>
         <input type="file" id="importFile" accept=".json" style="display:none;" onchange="importData(event)">
       </div>
@@ -472,13 +474,13 @@ function calcNetDuration(intervals, s) {
   for (const [si, so] of intervals) {
     const inMin = timeToMinutes(si);
     let outMin = timeToMinutes(so);
-    if (outMin <= inMin) outMin += 1440;
+    if (outMin < inMin) outMin += 1440; // only cross midnight when out < in
     total += (outMin - inMin);
   }
   for (const [si, so] of intervals) {
     const inMin = timeToMinutes(si);
     let outMin = timeToMinutes(so);
-    if (outMin <= inMin) outMin += 1440;
+    if (outMin < inMin) outMin += 1440;
     for (const [rs, re] of s.restPeriods) {
       let rsMin = timeToMinutes(rs);
       let reMin = timeToMinutes(re);
@@ -1137,6 +1139,545 @@ function importData(event) {
   reader.readAsText(file);
   // Reset file input so the same file can be re-imported
   event.target.value = '';
+}
+
+// ============ XLSX IMPORT (zero-dependency) ============
+// Minimal ZIP + XML parser for .xlsx files, no external libraries needed.
+
+function importXlsx(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = async function(e) {
+    try {
+      const buf = e.target.result;
+      const records = parseXlsxPunchRecords(buf);
+      if (!records.punchRows || records.punchRows.length <= 1) {
+        showToast('未找到有效打卡记录');
+        return;
+      }
+
+      // Build allPunches from parsed records
+      const imported = buildPunchesFromXlsx(records);
+
+      const dayCount = Object.keys(imported.punches).length;
+      const leaveCount = Object.keys(imported.leaves).reduce((s, k) => s + imported.leaves[k].length, 0);
+
+      if (!confirm(`从WeLink打卡Excel中解析到：\n📅 ${dayCount} 天打卡记录\n📝 ${leaveCount} 条请假记录\n\n将合并到现有数据（已有记录的日期会被覆盖）。确认导入？`)) {
+        return;
+      }
+
+      // Merge: overwrite existing days with imported data
+      for (const [dateKey, punchList] of Object.entries(imported.punches)) {
+        if (!allPunches[dateKey]) allPunches[dateKey] = { punches: [], leaveRecords: [] };
+        allPunches[dateKey].punches = punchList;
+      }
+      for (const [dateKey, leaveList] of Object.entries(imported.leaves)) {
+        if (!allPunches[dateKey]) allPunches[dateKey] = { punches: [], leaveRecords: [] };
+        allPunches[dateKey].leaveRecords = leaveList;
+      }
+
+      saveAllData();
+      renderSettings();
+      refreshAll();
+      showToast(`WeLink打卡导入成功：${dayCount}天打卡，${leaveCount}条请假`);
+    } catch (err) {
+      showToast('导入失败：' + err.message);
+      console.error(err);
+    }
+  };
+  reader.readAsArrayBuffer(file);
+  event.target.value = '';
+}
+
+function parseXlsxPunchRecords(arrayBuffer) {
+  // 1. Unzip the xlsx (which is a ZIP file)
+  const entries = unzipToArray(arrayBuffer);
+
+  // 2. Parse sharedStrings
+  const ssEntry = entries.find(e => e.path === 'xl/sharedStrings.xml');
+  const strings = ssEntry ? parseSharedStrings(new TextDecoder().decode(ssEntry.data)) : [];
+
+  // 3. Parse workbook to get sheet names
+  const wbEntry = entries.find(e => e.path === 'xl/workbook.xml');
+  const sheetNames = wbEntry ? parseWorkbookSheetNames(new TextDecoder().decode(wbEntry.data)) : [];
+
+  // 4. Find "打卡记录" and "电子流" sheets
+  //    We need to map sheet name -> rId -> sheet file via workbook.xml.rels
+  const relsEntry = entries.find(e => e.path === 'xl/_rels/workbook.xml.rels');
+  const rels = relsEntry ? parseRels(new TextDecoder().decode(relsEntry.data)) : {};
+
+  let punchSheetIdx = -1;
+  let leaveSheetIdx = -1;
+  for (let i = 0; i < sheetNames.length; i++) {
+    if (sheetNames[i] === '打卡记录') punchSheetIdx = i;
+    if (sheetNames[i] === '电子流') leaveSheetIdx = i;
+  }
+
+  // Fallback: if sheet names not found, use sheet1 and sheet2
+  let punchSheetPath = 'xl/worksheets/sheet1.xml';
+  let leaveSheetPath = 'xl/worksheets/sheet2.xml';
+
+  if (punchSheetIdx >= 0 || leaveSheetIdx >= 0) {
+    // rId is typically "rId1", "rId2", etc. — sheets are in order
+    const sheetRids = parseWorkbookSheetRids(new TextDecoder().decode(wbEntry.data));
+    if (punchSheetIdx >= 0 && sheetRids[punchSheetIdx]) {
+      const target = rels[sheetRids[punchSheetIdx]];
+      if (target) punchSheetPath = 'xl/' + target;
+    }
+    if (leaveSheetIdx >= 0 && sheetRids[leaveSheetIdx]) {
+      const target = rels[sheetRids[leaveSheetIdx]];
+      if (target) leaveSheetPath = 'xl/' + target;
+    }
+  }
+
+  // 5. Parse punch records (Sheet1)
+  const punchEntry = entries.find(e => e.path === punchSheetPath);
+  const punchRows = punchEntry ? parseSheetRows(new TextDecoder().decode(punchEntry.data), strings) : [];
+
+  // 6. Parse leave records (Sheet2)
+  const leaveEntry = entries.find(e => e.path === leaveSheetPath);
+  const leaveRows = leaveEntry ? parseSheetRows(new TextDecoder().decode(leaveEntry.data), strings) : [];
+
+  return { punchRows, leaveRows };
+}
+
+function buildPunchesFromXlsx(records) {
+  const result = { punches: {}, leaves: {} };
+  const { punchRows, leaveRows } = records;
+
+  // Group punch records by date
+  // punchRows: [[time, address, empId, source], ...]
+  // We skip "电子流" rows (source === '电子流') — those are leave markers mixed into punch sheet
+  // We also skip "未知" rows (system-generated defaults like 08:00/17:30 with empty address)
+  // For each real day, take earliest punch as clock-in, latest as clock-out
+  const dayPunches = {}; // dateKey -> [timeStr, ...]
+
+  for (let i = 1; i < punchRows.length; i++) { // skip header row
+    const row = punchRows[i];
+    if (!row || row.length < 4) continue;
+    const timeStr = row[0]; // "2026-06-17 08:42:10"
+    const address = row[1] || '';
+    const empId = row[2] || '';
+    const source = row[3] || '';
+
+    // Skip leave records mixed in punch sheet (they're also in Sheet2)
+    if (source === '电子流') continue;
+    // Skip "未知" (system default) — these are auto-generated 08:00/17:30 with empty address
+    if (source === '未知') continue;
+
+    // Parse date and time
+    const parsed = parseDateTimeStr(timeStr);
+    if (!parsed) continue;
+
+    const key = parsed.dateKey; // "2026-06-17"
+    const time = parsed.timeStr; // "08:42"
+
+    if (!dayPunches[key]) dayPunches[key] = [];
+    dayPunches[key].push(time);
+  }
+
+  // For each day, sort times and create punch pairs (earliest=in, latest=out)
+  for (const [key, times] of Object.entries(dayPunches)) {
+    times.sort();
+    const punchIn = times[0];
+    const punchOut = times[times.length - 1];
+    // Only add if they differ (or it's a single punch — we still record it)
+    result.punches[key] = [[punchIn, punchOut]];
+  }
+
+  // Parse leave records from Sheet2
+  // leaveRows: [[流程ID, 请假类型, 请假日期, 开始时间, 结束时间, 请假备注, 员工编号], ...]
+  for (let i = 1; i < leaveRows.length; i++) { // skip header
+    const row = leaveRows[i];
+    if (!row || row.length < 5) continue;
+    const startDateStr = row[3]; // "2026-07-06 08:00"
+    const endDateStr = row[4];   // "2026-07-06 12:00"
+
+    const startParsed = parseDateTimeStr(startDateStr);
+    const endParsed = parseDateTimeStr(endDateStr);
+    if (!startParsed || !endParsed) continue;
+
+    // Leave might span multiple days — for simplicity, handle single-day
+    const key = startParsed.dateKey;
+    if (!result.leaves[key]) result.leaves[key] = [];
+    result.leaves[key].push([startParsed.timeStr, endParsed.timeStr]);
+  }
+
+  // Also extract leave info from punch sheet's "电子流" rows (for cross-day or completeness)
+  // These have address = "事假" and source = "电子流"
+  // We can get the date from the time, and match with Sheet2 data
+  // But Sheet2 is more authoritative, so we rely on it primarily.
+  // However, if Sheet2 is missing, we can derive from punch sheet:
+  const leaveFromPunchSheet = {};
+  for (let i = 1; i < punchRows.length; i++) {
+    const row = punchRows[i];
+    if (!row || row.length < 4) continue;
+    const source = row[3] || '';
+    if (source !== '电子流') continue;
+
+    const timeStr = row[0]; // "2026-06-22 08:00:00"
+    const parsed = parseDateTimeStr(timeStr);
+    if (!parsed) continue;
+
+    const key = parsed.dateKey;
+    if (!leaveFromPunchSheet[key]) leaveFromPunchSheet[key] = [];
+    leaveFromPunchSheet[key].push(parsed.timeStr);
+  }
+  // For each day in leaveFromPunchSheet, pair consecutive entries as leave periods
+  for (const [key, times] of Object.entries(leaveFromPunchSheet)) {
+    times.sort();
+    // If we already have leave from Sheet2, skip
+    if (result.leaves[key] && result.leaves[key].length > 0) continue;
+    // Pair consecutive times as leave periods
+    const pairs = [];
+    for (let i = 0; i < times.length; i += 2) {
+      if (i + 1 < times.length) {
+        pairs.push([times[i], times[i + 1]]);
+      }
+    }
+    if (pairs.length > 0) result.leaves[key] = pairs;
+  }
+
+  return result;
+}
+
+function parseDateTimeStr(str) {
+  if (!str) return null;
+  // Handle formats: "2026-06-17 08:42:10" or "2026-07-06 08:00" or "2026-06-22 13:30:00"
+  const m = str.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})/);
+  if (!m) return null;
+  const dateKey = `${m[1]}-${m[2]}-${m[3]}`;
+  const timeStr = `${m[4]}:${m[5]}`;
+  return { dateKey, timeStr };
+}
+
+// ============ Minimal ZIP Parser ============
+function unzipToArray(arrayBuffer) {
+  const bytes = new Uint8Array(arrayBuffer);
+  const entries = [];
+
+  // Find End of Central Directory
+  let eocdPos = -1;
+  for (let i = bytes.length - 22; i >= 0; i--) {
+    if (bytes[i] === 0x50 && bytes[i+1] === 0x4B && bytes[i+2] === 0x05 && bytes[i+3] === 0x06) {
+      eocdPos = i;
+      break;
+    }
+  }
+  if (eocdPos < 0) throw new Error('Not a valid ZIP file');
+
+  const cdOffset = readUint32(bytes, eocdPos + 16);
+  const cdCount = readUint16(bytes, eocdPos + 10);
+
+  let pos = cdOffset;
+  for (let i = 0; i < cdCount; i++) {
+    if (bytes[pos] !== 0x50 || bytes[pos+1] !== 0x4B || bytes[pos+2] !== 0x01 || bytes[pos+3] !== 0x02) break;
+
+    const method = readUint16(bytes, pos + 10);
+    const compSize = readUint32(bytes, pos + 20);
+    const uncompSize = readUint32(bytes, pos + 24);
+    const nameLen = readUint16(bytes, pos + 28);
+    const extraLen = readUint16(bytes, pos + 30);
+    const commentLen = readUint16(bytes, pos + 32);
+    const localOffset = readUint32(bytes, pos + 42);
+
+    const nameBytes = bytes.slice(pos + 46, pos + 46 + nameLen);
+    const name = new TextDecoder().decode(nameBytes);
+
+    // Read from local file header
+    const lhNameLen = readUint16(bytes, localOffset + 26);
+    const lhExtraLen = readUint16(bytes, localOffset + 28);
+    const dataStart = localOffset + 30 + lhNameLen + lhExtraLen;
+    const compData = bytes.slice(dataStart, dataStart + compSize);
+
+    let data;
+    if (method === 0) {
+      // Stored (no compression)
+      data = compData;
+    } else if (method === 8) {
+      // Deflate — use browser's DecompressionStream
+      data = inflateRaw(compData);
+    } else {
+      data = compData;
+    }
+
+    entries.push({ path: name, data });
+    pos += 46 + nameLen + extraLen + commentLen;
+  }
+
+  return entries;
+}
+
+function readUint16(bytes, offset) {
+  return bytes[offset] | (bytes[offset + 1] << 8);
+}
+
+function readUint32(bytes, offset) {
+  return (bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24)) >>> 0;
+}
+
+// Inflate raw deflate using browser's DecompressionStream (async-capable, but we use sync wrapper)
+// Since DecompressionStream is async, we need a different approach for sync usage.
+// Instead, we implement a minimal raw deflate decoder.
+function inflateRaw(data) {
+  // Use the browser's DecompressionStream API (available in all modern browsers)
+  // We need to wrap it synchronously — but DecompressionStream is async.
+  // Alternative: implement a tiny inflate. For xlsx files, they're typically small.
+  // Let's use a simple synchronous inflate implementation.
+
+  // Actually, the simplest approach: use a sync XHR to a blob URL. But that's ugly.
+  // Better: make the whole import flow async, which we already did (reader.onload is async-capable).
+  // Let's throw and catch in an async wrapper.
+
+  // For simplicity, we'll use a tiny pure-JS inflate implementation:
+  return inflateRawSync(data);
+}
+
+// Minimal raw deflate (RFC 1951) decoder — handles the common case for xlsx files
+function inflateRawSync(input) {
+  let pos = 0;
+  const output = [];
+  let bitBuf = 0;
+  let bitCnt = 0;
+
+  function readBits(n) {
+    while (bitCnt < n) {
+      if (pos >= input.length) throw new Error('Unexpected end of deflate stream');
+      bitBuf |= input[pos++] << bitCnt;
+      bitCnt += 8;
+    }
+    const val = bitBuf & ((1 << n) - 1);
+    bitBuf >>= n;
+    bitCnt -= n;
+    return val;
+  }
+
+  function readBitsReset() {
+    bitBuf = 0;
+    bitCnt = 0;
+  }
+
+  readBitsReset();
+
+  // Build fixed Huffman tables
+  function buildFixedLitLenTree() {
+    const lengths = [];
+    for (let i = 0; i <= 143; i++) lengths.push(8);
+    for (let i = 144; i <= 255; i++) lengths.push(9);
+    for (let i = 256; i <= 279; i++) lengths.push(7);
+    for (let i = 280; i <= 287; i++) lengths.push(8);
+    return buildHuffmanTree(lengths);
+  }
+
+  function buildFixedDistTree() {
+    const lengths = [];
+    for (let i = 0; i < 32; i++) lengths.push(5);
+    return buildHuffmanTree(lengths);
+  }
+
+  const fixedLitLen = buildFixedLitLenTree();
+  const fixedDist = buildFixedDistTree();
+
+  const LEN_EXTRA = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];
+  const LEN_BASE = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258];
+  const DIST_EXTRA = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];
+  const DIST_BASE = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577];
+
+  while (true) {
+    const bfinal = readBits(1);
+    const btype = readBits(2);
+
+    let litLenTree, distTree;
+
+    if (btype === 1) {
+      litLenTree = fixedLitLen;
+      distTree = fixedDist;
+    } else if (btype === 2) {
+      // Dynamic Huffman
+      const hlit = readBits(5) + 257;
+      const hdist = readBits(5) + 1;
+      const hclen = readBits(4) + 4;
+
+      const CL_ORDER = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15];
+      const clLens = new Array(19).fill(0);
+      for (let i = 0; i < hclen; i++) clLens[CL_ORDER[i]] = readBits(3);
+      const clTree = buildHuffmanTree(clLens);
+
+      const codeLens = [];
+      let total = hlit + hdist;
+      while (codeLens.length < total) {
+        const sym = decodeSymbol(clTree, readBits);
+        if (sym < 16) {
+          codeLens.push(sym);
+        } else if (sym === 16) {
+          const rep = readBits(2) + 3;
+          const last = codeLens[codeLens.length - 1];
+          for (let r = 0; r < rep; r++) codeLens.push(last);
+        } else if (sym === 17) {
+          const rep = readBits(3) + 3;
+          for (let r = 0; r < rep; r++) codeLens.push(0);
+        } else if (sym === 18) {
+          const rep = readBits(7) + 11;
+          for (let r = 0; r < rep; r++) codeLens.push(0);
+        }
+      }
+
+      litLenTree = buildHuffmanTree(codeLens.slice(0, hlit));
+      distTree = buildHuffmanTree(codeLens.slice(hlit));
+    } else if (btype === 0) {
+      // No compression — skip to byte boundary, read LEN/NLEN
+      readBitsReset();
+      const len = input[pos] | (input[pos+1] << 8);
+      pos += 4;
+      for (let i = 0; i < len; i++) output.push(input[pos++]);
+      if (bfinal) break;
+      continue;
+    } else {
+      throw new Error('Invalid deflate block type');
+    }
+
+    // Decode compressed data
+    while (true) {
+      const sym = decodeSymbol(litLenTree, readBits);
+      if (sym < 256) {
+        output.push(sym);
+      } else if (sym === 256) {
+        break; // end of block
+      } else {
+        const li = sym - 257;
+        const len = LEN_BASE[li] + (LEN_EXTRA[li] > 0 ? readBits(LEN_EXTRA[li]) : 0);
+        const dsym = decodeSymbol(distTree, readBits);
+        const dist = DIST_BASE[dsym] + (DIST_EXTRA[dsym] > 0 ? readBits(DIST_EXTRA[dsym]) : 0);
+        for (let i = 0; i < len; i++) {
+          output.push(output[output.length - dist]);
+        }
+      }
+    }
+
+    if (bfinal) break;
+  }
+
+  return new Uint8Array(output);
+}
+
+function buildHuffmanTree(lengths) {
+  // Build a simple lookup table for decoding
+  const maxLen = Math.max(...lengths.filter(l => l > 0));
+  if (maxLen === 0) return { codes: {}, maxBits: 0 };
+
+  // Count codes of each length
+  const blCount = new Array(maxLen + 1).fill(0);
+  for (const l of lengths) if (l > 0) blCount[l]++;
+
+  // Compute next_code
+  const nextCode = new Array(maxLen + 1).fill(0);
+  let code = 0;
+  for (let bits = 1; bits <= maxLen; bits++) {
+    code = (code + blCount[bits - 1]) << 1;
+    nextCode[bits] = code;
+  }
+
+  // Assign codes
+  const codes = {};
+  for (let n = 0; n < lengths.length; n++) {
+    const len = lengths[n];
+    if (len > 0) {
+      codes[nextCode[len] + '_' + len] = n;
+      nextCode[len]++;
+    }
+  }
+
+  return { codes, maxBits: maxLen };
+}
+
+function decodeSymbol(tree, readBitsFn) {
+  if (tree.maxBits === 0) throw new Error('Empty Huffman tree');
+  let code = 0;
+  for (let bits = 1; bits <= tree.maxBits; bits++) {
+    code = (code << 1) | readBitsFn(1);
+    const key = code + '_' + bits;
+    if (tree.codes[key] !== undefined) return tree.codes[key];
+  }
+  throw new Error('Invalid Huffman code');
+}
+
+// ============ XLSX XML Parsers ============
+function parseSharedStrings(xml) {
+  const strings = [];
+  // Simple regex-based parser for <si> elements
+  const siRegex = /<si[^>]*>([\s\S]*?)<\/si>/g;
+  let match;
+  while ((match = siRegex.exec(xml)) !== null) {
+    const content = match[1];
+    // Extract all <t> text within this <si>
+    const parts = [];
+    const tRegex = /<t[^>]*>([\s\S]*?)<\/t>/g;
+    let tMatch;
+    while ((tMatch = tRegex.exec(content)) !== null) {
+      parts.push(unescapeXml(tMatch[1]));
+    }
+    strings.push(parts.join(''));
+  }
+  return strings;
+}
+
+function parseWorkbookSheetNames(xml) {
+  const names = [];
+  const regex = /<sheet[^>]+name="([^"]*)"/g;
+  let match;
+  while ((match = regex.exec(xml)) !== null) {
+    names.push(unescapeXml(match[1]));
+  }
+  return names;
+}
+
+function parseWorkbookSheetRids(xml) {
+  const rids = [];
+  const regex = /<sheet[^>]+r:id="([^"]*)"/g;
+  let match;
+  while ((match = regex.exec(xml)) !== null) {
+    rids.push(match[1]);
+  }
+  return rids;
+}
+
+function parseRels(xml) {
+  const rels = {};
+  const regex = /<Relationship[^>]+Id="([^"]*)"[^>]+Target="([^"]*)"/g;
+  let match;
+  while ((match = regex.exec(xml)) !== null) {
+    rels[match[1]] = match[2];
+  }
+  return rels;
+}
+
+function parseSheetRows(xml, strings) {
+  const rows = [];
+  const rowRegex = /<row[^>]*>([\s\S]*?)<\/row>/g;
+  let rowMatch;
+  while ((rowMatch = rowRegex.exec(xml)) !== null) {
+    const rowContent = rowMatch[1];
+    const cells = [];
+    const cellRegex = /<c[^>]+r="([^"]*)"(?:[^>]*t="([^"]*)")?[^>]*>(?:<v>([\s\S]*?)<\/v>)?(?:[\s\S]*?)<\/c>/g;
+    let cellMatch;
+    while ((cellMatch = cellRegex.exec(rowContent)) !== null) {
+      const ref = cellMatch[1];
+      const type = cellMatch[2] || '';
+      const value = cellMatch[3] || '';
+      if (type === 's') {
+        cells.push(strings[parseInt(value)] || '');
+      } else {
+        cells.push(unescapeXml(value));
+      }
+    }
+    rows.push(cells);
+  }
+  return rows;
+}
+
+function unescapeXml(str) {
+  return str.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'");
 }
 
 // ============ INIT ============
