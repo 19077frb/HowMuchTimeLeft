@@ -304,7 +304,7 @@ body {
         <label>数据管理</label>
         <button class="btn btn-sm" style="background:#2e7d32;" onclick="exportData()">📥 导出数据</button>
         <button class="btn btn-sm" style="background:#1565c0;" onclick="document.getElementById('importFile').click()">📤 导入JSON</button>
-        <button class="btn btn-sm" style="background:#6a1b9a;" onclick="document.getElementById('importXlsxFile').click()">📊 导入WeLink打卡Excel</button>
+        <button class="btn btn-sm" style="background:#6a1b9a;" onclick="document.getElementById('importXlsxFile').click()">📊 导入Excel</button>
         <input type="file" id="importXlsxFile" accept=".xlsx" style="display:none;" onchange="importXlsx(event)">
         <button class="btn btn-secondary btn-sm" onclick="resetAll()">🔄 重置</button>
         <input type="file" id="importFile" accept=".json" style="display:none;" onchange="importData(event)">
