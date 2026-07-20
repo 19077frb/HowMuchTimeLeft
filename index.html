@@ -129,6 +129,10 @@ body {
   font-size: 1rem; transition: opacity 0.2s;
 }
 .calendar-nav button:hover { opacity: 0.8; }
+.calendar-nav .btn-today {
+  width: auto; height: auto; border-radius: 8px;
+  padding: 6px 14px; font-size: 0.85rem;
+}
 .calendar-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; text-align: center; }
 .calendar-header { color: var(--text2); font-size: 0.8rem; padding: 8px 0; }
 .calendar-header.weekend { color: var(--accent); opacity: 0.7; }
@@ -351,7 +355,7 @@ body {
         <button onclick="navMonth(-1)">◀</button>
         <span class="month-label" id="monthLabel"></span>
         <button onclick="navMonth(1)">▶</button>
-        <button class="btn btn-secondary btn-sm" onclick="goToday()">今天</button>
+        <button class="btn-today" onclick="goToday()">今天</button>
       </div>
       <div class="calendar-grid" id="calendarHeader"></div>
       <div class="calendar-grid" id="calendarBody"></div>
