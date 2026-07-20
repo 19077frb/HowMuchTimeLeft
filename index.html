@@ -552,9 +552,19 @@ function calcDayBalance(dateKeyStr, useSettings = null) {
   ]);
   const effectiveWorked = calcNetDuration(mergedAsStrings, s);
 
-  // For display: calculate regular and leave portions separately (no double-counting)
-  const regularWorked = hasPunches ? calcNetDuration(data.punches, s) : 0;
-  const leaveDuration = hasLeave ? calcNetDuration(data.leaveRecords, s) : 0;
+  // For display: calculate regular and leave portions separately, each merged first
+  const mergedPunches = hasPunches ? mergeIntervals(data.punches) : [];
+  const mergedPunchStr = mergedPunches.map(([start, end]) => [
+    minutesToTimeHM(start % 1440),
+    minutesToTimeHM(end % 1440),
+  ]);
+  const mergedLeaves = hasLeave ? mergeIntervals(data.leaveRecords) : [];
+  const mergedLeaveStr = mergedLeaves.map(([start, end]) => [
+    minutesToTimeHM(start % 1440),
+    minutesToTimeHM(end % 1440),
+  ]);
+  const regularWorked = hasPunches ? calcNetDuration(mergedPunchStr, s) : 0;
+  const leaveDuration = hasLeave ? calcNetDuration(mergedLeaveStr, s) : 0;
 
   const balance = effectiveWorked - netTarget; // + = overflow, - = deficit
 
